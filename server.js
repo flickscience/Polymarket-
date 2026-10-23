@@ -1,46 +1,318 @@
+
 import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
 import http from "node:http";
 
-const app = express(), server = http.createServer(app);
+const app = express();
+const server = http.createServer(app);
 const browserWss = new WebSocketServer({ noServer: true });
+
 const PORT = Number(process.env.PORT || 3000);
 const GAMMA = "https://gamma-api.polymarket.com";
 const CLOB = "https://clob.polymarket.com";
 const MARKET_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+
 app.use(express.static("public"));
-const arr = v => { if (Array.isArray(v)) return v; try { const x=JSON.parse(v); return Array.isArray(x)?x:[]; } catch { return []; } };
+
+const arr = value => {
+  if (Array.isArray(value)) return value;
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+};
+
+async function fetchJson(url, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: { accept: "application/json" }
+    });
+
+    if (!response.ok) {
+      throw new Error(`API HTTP ${response.status}`);
+    }
+
+    return await response.json();
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw new Error("Polymarket API timed out. Try refreshing.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function normalizeMarket(m) {
-  const outcomes=arr(m.outcomes), tokens=arr(m.clobTokenIds ?? m.clob_token_ids), prices=arr(m.outcomePrices);
-  return { id:m.id, question:m.question||m.groupItemTitle||m.slug||"Market", slug:m.slug,
-    marketType:m.sportsMarketType||m.marketType||m.groupItemTitle||"", description:m.description||"",
-    active:m.active, closed:m.closed, volume:Number(m.volumeNum??m.volume??0), liquidity:Number(m.liquidityNum??m.liquidity??0),
-    outcomes:outcomes.map((name,i)=>({name:String(name),tokenId:tokens[i]?String(tokens[i]):null,gammaPrice:prices[i]!=null?Number(prices[i]):null})),
-    raw:{groupItemTitle:m.groupItemTitle||null,sportsMarketType:m.sportsMarketType||null,eventSlug:m.eventSlug||null} };
-}
-app.get("/api/event/:slug", async (req,res)=>{
-  try {
-    const u=new URL("/events",GAMMA); u.searchParams.set("slug",req.params.slug);
-    const r=await fetch(u,{headers:{accept:"application/json"}}); if(!r.ok) throw Error(`Gamma HTTP ${r.status}`);
-    const d=await r.json(), e=Array.isArray(d)?d[0]:d; if(!e) return res.status(404).json({error:"Event not found"});
-    let markets=Array.isArray(e.markets)?e.markets:[];
-    if(!markets.length && e.id){const mu=new URL("/markets",GAMMA);mu.searchParams.set("event_id",String(e.id));mu.searchParams.set("limit","100");const mr=await fetch(mu);if(mr.ok)markets=await mr.json();}
-    res.json({event:{id:e.id,title:e.title||e.name||req.params.slug,slug:e.slug||req.params.slug,startDate:e.startDate||e.startTime||null,endDate:e.endDate||null,active:e.active,closed:e.closed},markets:markets.map(normalizeMarket),fetchedAt:new Date().toISOString()});
-  } catch(err){res.status(502).json({error:"Could not fetch event metadata",detail:err.message});}
-});
-app.get("/api/book/:tokenId",async(req,res)=>{try{const u=new URL("/book",CLOB);u.searchParams.set("token_id",req.params.tokenId);const r=await fetch(u);if(!r.ok)throw Error(`CLOB HTTP ${r.status}`);res.json(await r.json());}catch(err){res.status(502).json({error:"Could not fetch book",detail:err.message});}});
-app.get("/api/health",(_req,res)=>res.json({ok:true,time:new Date().toISOString()}));
+  const outcomes = arr(m.outcomes);
+  const tokens = arr(m.clobTokenIds ?? m.clob_token_ids);
+  const prices = arr(m.outcomePrices);
 
-const clients=new Set();let marketSocket,reconnectTimer;const subscribedIds=new Set();
-function broadcast(obj){const s=JSON.stringify(obj);for(const c of clients)if(c.readyState===WebSocket.OPEN)c.send(s);}
-function connectMarketSocket(){
-  clearTimeout(reconnectTimer); marketSocket=new WebSocket(MARKET_WS);
-  marketSocket.on("open",()=>{broadcast({type:"connection",status:"connected"});if(subscribedIds.size)marketSocket.send(JSON.stringify({assets_ids:[...subscribedIds],type:"market",initial_dump:true}));marketSocket.heartbeat=setInterval(()=>{if(marketSocket?.readyState===WebSocket.OPEN)marketSocket.send("PING");},10000);});
-  marketSocket.on("message",d=>{const s=d.toString();if(s==="PONG")return;try{broadcast({type:"market_data",data:JSON.parse(s),receivedAt:Date.now()});}catch{broadcast({type:"market_raw",data:s});}});
-  marketSocket.on("close",()=>{clearInterval(marketSocket?.heartbeat);broadcast({type:"connection",status:"reconnecting"});reconnectTimer=setTimeout(connectMarketSocket,1500);});
-  marketSocket.on("error",()=>{try{marketSocket.close();}catch{}});
+  return {
+    id: m.id,
+    question: m.question || m.groupItemTitle || m.slug || "Market",
+    slug: m.slug,
+    active: m.active,
+    closed: m.closed,
+    outcomes: outcomes.map((name, i) => ({
+      name: String(name),
+      tokenId: tokens[i] ? String(tokens[i]) : null,
+      gammaPrice: prices[i] != null ? Number(prices[i]) : null
+    }))
+  };
 }
-browserWss.on("connection",ws=>{clients.add(ws);ws.send(JSON.stringify({type:"connection",status:marketSocket?.readyState===WebSocket.OPEN?"connected":"connecting"}));ws.on("message",raw=>{try{const m=JSON.parse(raw.toString());if(m.type==="subscribe"&&Array.isArray(m.tokenIds)){const fresh=m.tokenIds.map(String).filter(id=>id&&!subscribedIds.has(id));fresh.forEach(id=>subscribedIds.add(id));if(fresh.length&&marketSocket?.readyState===WebSocket.OPEN)marketSocket.send(JSON.stringify({assets_ids:fresh,type:"market",initial_dump:true}));}}catch{}});ws.on("close",()=>clients.delete(ws));});
-server.on("upgrade",(req,socket,head)=>{if(req.url==="/ws")browserWss.handleUpgrade(req,socket,head,ws=>browserWss.emit("connection",ws,req));else socket.destroy();});
-connectMarketSocket();server.listen(PORT,()=>console.log(`Dashboard running at http://localhost:${PORT}`));
+
+function normalizeEvent(e) {
+  const markets = Array.isArray(e.markets) ? e.markets : [];
+  const tags = Array.isArray(e.tags) ? e.tags : [];
+
+  const title = e.title || e.name || e.slug || "Event";
+  const tagNames = tags.map(t =>
+    typeof t === "string" ? t : (t.label || t.slug || "")
+  );
+
+  const text = [
+    title,
+    e.slug,
+    e.sport,
+    e.category,
+    e.seriesSlug,
+    ...tagNames
+  ].filter(Boolean).join(" ").toLowerCase();
+
+  let sport = "Other";
+  if (/cricket/.test(text)) sport = "Cricket";
+  else if (/tennis/.test(text)) sport = "Tennis";
+  else if (/soccer|football|epl|premier-league|la-liga|champions-league/.test(text)) {
+    sport = "Soccer";
+  }
+
+  const explicitLive =
+    e.live === true ||
+    e.isLive === true ||
+    /^(live|in play|in-play|in_progress|in progress)$/i.test(
+      String(e.status || e.gameStatus || e.state || "")
+    );
+
+  const marketsNormalized = markets.map(normalizeMarket);
+
+  return {
+    id: e.id,
+    title,
+    slug: e.slug || "",
+    sport,
+    live: explicitLive,
+    status: e.status || e.gameStatus || e.state || "",
+    startDate: e.startDate || e.startTime || null,
+    endDate: e.endDate || null,
+    markets: marketsNormalized
+  };
+}
+
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true, time: new Date().toISOString() });
+});
+
+/*
+ * Discover active, open events, then retain only events whose metadata
+ * explicitly identifies them as live. "active" alone does not mean live.
+ */
+app.get("/api/events", async (_req, res) => {
+  try {
+    const url = new URL("/events", GAMMA);
+    url.searchParams.set("active", "true");
+    url.searchParams.set("closed", "false");
+    url.searchParams.set("limit", "100");
+    url.searchParams.set("order", "volume24hr");
+    url.searchParams.set("ascending", "false");
+
+    const data = await fetchJson(url.toString());
+    if (!Array.isArray(data)) {
+      throw new Error("Unexpected event API response");
+    }
+
+    const normalized = data.map(normalizeEvent);
+    const liveEvents = normalized.filter(
+      e => e.live && ["Soccer", "Cricket", "Tennis"].includes(e.sport)
+    );
+
+    res.set("Cache-Control", "no-store");
+    res.json({
+      events: liveEvents,
+      count: liveEvents.length,
+      fetchedAt: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error("Event discovery failed:", error.message);
+    res.status(502).json({
+      error: "Event discovery failed",
+      detail: error.message
+    });
+  }
+});
+
+app.get("/api/event/:slug", async (req, res) => {
+  try {
+    const url = new URL("/events", GAMMA);
+    url.searchParams.set("slug", req.params.slug);
+
+    const data = await fetchJson(url.toString());
+    const event = Array.isArray(data) ? data[0] : data;
+
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+
+    const normalized = normalizeEvent(event);
+    res.json({ event: normalized, fetchedAt: new Date().toISOString() });
+  } catch (error) {
+    res.status(502).json({
+      error: "Could not fetch event metadata",
+      detail: error.message
+    });
+  }
+});
+
+app.get("/api/book/:tokenId", async (req, res) => {
+  try {
+    const url = new URL("/book", CLOB);
+    url.searchParams.set("token_id", req.params.tokenId);
+
+    res.json(await fetchJson(url.toString()));
+  } catch (error) {
+    res.status(502).json({
+      error: "Could not fetch book",
+      detail: error.message
+    });
+  }
+});
+
+const clients = new Set();
+const subscribedIds = new Set();
+
+let marketSocket;
+let reconnectTimer;
+let heartbeatTimer;
+
+function broadcast(message) {
+  const payload = JSON.stringify(message);
+
+  for (const client of clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(payload);
+    }
+  }
+}
+
+function sendSubscriptions(ids) {
+  if (!marketSocket || marketSocket.readyState !== WebSocket.OPEN || !ids.length) {
+    return;
+  }
+
+  marketSocket.send(JSON.stringify({
+    assets_ids: ids,
+    type: "market",
+    initial_dump: true
+  }));
+}
+
+function connectMarketSocket() {
+  clearTimeout(reconnectTimer);
+  clearInterval(heartbeatTimer);
+
+  marketSocket = new WebSocket(MARKET_WS);
+
+  marketSocket.on("open", () => {
+    console.log("Polymarket market feed connected");
+    broadcast({ type: "connection", status: "connected" });
+
+    sendSubscriptions([...subscribedIds]);
+
+    heartbeatTimer = setInterval(() => {
+      if (marketSocket?.readyState === WebSocket.OPEN) {
+        marketSocket.send("PING");
+      }
+    }, 10000);
+  });
+
+  marketSocket.on("message", raw => {
+    const message = raw.toString();
+    if (message === "PONG") return;
+
+    try {
+      broadcast({
+        type: "market_data",
+        data: JSON.parse(message),
+        receivedAt: Date.now()
+      });
+    } catch {
+      broadcast({ type: "market_raw", data: message });
+    }
+  });
+
+  marketSocket.on("close", () => {
+    clearInterval(heartbeatTimer);
+    broadcast({ type: "connection", status: "reconnecting" });
+    reconnectTimer = setTimeout(connectMarketSocket, 3000);
+  });
+
+  marketSocket.on("error", error => {
+    console.error("Market WebSocket error:", error.message);
+    try {
+      marketSocket.close();
+    } catch {}
+  });
+}
+
+browserWss.on("connection", client => {
+  clients.add(client);
+
+  client.send(JSON.stringify({
+    type: "connection",
+    status: marketSocket?.readyState === WebSocket.OPEN
+      ? "connected"
+      : "connecting"
+  }));
+
+  client.on("message", raw => {
+    try {
+      const message = JSON.parse(raw.toString());
+
+      // Matches the current HTML: { type: "subscribe", tokenIds: [...] }
+      if (message.type === "subscribe" && Array.isArray(message.tokenIds)) {
+        const fresh = message.tokenIds
+          .map(String)
+          .filter(id => id && !subscribedIds.has(id));
+
+        for (const id of fresh) subscribedIds.add(id);
+        sendSubscriptions(fresh);
+      }
+    } catch (error) {
+      console.error("Invalid browser message:", error.message);
+    }
+  });
+
+  client.on("close", () => clients.delete(client));
+});
+
+server.on("upgrade", (request, socket, head) => {
+  if (request.url === "/ws") {
+    browserWss.handleUpgrade(request, socket, head, client => {
+      browserWss.emit("connection", client, request);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+connectMarketSocket();
+
+server.listen(PORT, () => {
+  console.log(`Dashboard listening on port ${PORT}`);
+});
