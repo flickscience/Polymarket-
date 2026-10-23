@@ -1,1 +1,241 @@
- <!-- Polymarket dashboard -->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Polymarket Live Speed Test</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:Arial,sans-serif;margin:0;background:#f5f6f8;color:#18202b}
+header{background:#111827;color:white;padding:16px}
+h2{margin:0 0 8px;font-size:21px}
+main{max-width:1000px;margin:auto;padding:14px}
+button,select,input{font:inherit;padding:10px;border:1px solid #cbd5e1;border-radius:8px;background:white}
+button{cursor:pointer}
+button.active{background:#1d4ed8;color:white}
+.controls{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}
+.status{background:white;padding:12px;border-radius:10px;margin:12px 0;font-size:14px}
+.layout{display:grid;grid-template-columns:1fr;gap:12px}
+.panel{background:white;border:1px solid #e2e8f0;border-radius:10px;padding:12px}
+.match{display:block;width:100%;text-align:left;margin:7px 0;padding:12px}
+.match small{display:block;color:#64748b;margin-top:5px}
+.live{color:#15803d;font-weight:bold}
+.market{border-top:1px solid #e2e8f0;padding:12px 0;overflow-wrap:anywhere}
+.muted{color:#64748b;font-size:13px}
+#error{color:#b91c1c;white-space:pre-wrap}
+@media(min-width:700px){.layout{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body>
+<header>
+  <h2>Polymarket Live Speed Test</h2>
+  <div>Live matches only · Read-only · No orders placed</div>
+</header>
+<main>
+  <div class="controls" id="sports">
+    <button class="active" data-sport="Soccer">Soccer</button>
+    <button data-sport="Cricket">Cricket</button>
+    <button data-sport="Tennis">Tennis</button>
+    <button data-sport="All">All sports</button>
+  </div>
+
+  <div class="controls">
+    <input id="filter" placeholder="Search live matches" style="flex:1;min-width:180px">
+    <button id="refresh">Refresh matches</button>
+  </div>
+
+  <div class="status">
+    <div id="status">Starting…</div>
+    <div class="muted" id="counts">Matches: 0 · Feed: connecting</div>
+    <div class="muted" id="last">Last update: —</div>
+    <div id="error"></div>
+  </div>
+
+  <div class="layout">
+    <section class="panel">
+      <h3>Live matches</h3>
+      <div class="muted">Choose a match to view its markets.</div>
+      <div id="matches">Loading live matches…</div>
+    </section>
+    <section class="panel">
+      <h3 id="selectedTitle">Selected match</h3>
+      <div id="details" class="muted">Select a live match from the list.</div>
+      <div id="markets"></div>
+    </section>
+  </div>
+  <p class="muted">Prices and availability depend on Polymarket's public API. Live status is shown only when confirmed by the event data. No trading actions are available here.</p>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let sport = "Soccer";
+let events = [];
+let selected = null;
+let ws;
+let feedStatus = "connecting";
+let lastPacket = null;
+let reconnectTimer;
+const books = new Map();
+
+function text(value) {
+  return String(value ?? "").replace(/[&<>"']/g, c => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+  }[c]));
+}
+
+function isLive(e) {
+  if (e.live === true || e.isLive === true) return true;
+  const status = String(e.status || e.state || e.eventStatus || "").toLowerCase();
+  if (["live","in-play","in play","in_progress","in progress"].includes(status)) return true;
+  if (e.live === false || e.isLive === false) return false;
+  return false;
+}
+
+function eventSport(e) {
+  const s = String(e.sport || e.category || e.sportsMarketType || "").toLowerCase();
+  const title = String(e.title || e.name || e.slug || "");
+  if (s.includes("cricket") || /cricket/i.test(title)) return "Cricket";
+  if (s.includes("tennis") || /tennis/i.test(title)) return "Tennis";
+  if (s.includes("soccer") || s.includes("football") || /soccer|football/i.test(title)) return "Soccer";
+  return "Other";
+}
+
+function eventTitle(e) {
+  return e.title || e.name || e.question || e.slug || "Live event";
+}
+
+function eventId(e) {
+  return String(e.id ?? e.slug ?? eventTitle(e));
+}
+
+function renderMatches() {
+  const q = $("filter").value.trim().toLowerCase();
+  const list = events.filter(e => isLive(e))
+    .filter(e => sport === "All" || eventSport(e) === sport)
+    .filter(e => eventTitle(e).toLowerCase().includes(q));
+
+  $("counts").textContent = `Matches: ${list.length} · Feed: ${feedStatus}`;
+  if (!list.length) {
+    $("matches").innerHTML = '<p class="muted">No confirmed live matches found for this filter.</p>';
+    return;
+  }
+
+  $("matches").innerHTML = list.map(e => `
+    <button class="match" data-id="${text(eventId(e))}">
+      <span class="live">● LIVE</span> ${text(eventTitle(e))}
+      <small>${text(eventSport(e))}</small>
+    </button>`).join("");
+
+  $("matches").querySelectorAll("button").forEach(b => {
+    b.addEventListener("click", () => {
+      selected = list.find(e => eventId(e) === b.dataset.id);
+      renderSelected();
+    });
+  });
+}
+
+function renderSelected() {
+  if (!selected) return;
+  $("selectedTitle").textContent = eventTitle(selected);
+  $("details").innerHTML = `
+    <p class="live">● LIVE status reported by event data</p>
+    <p class="muted">Event: ${text(selected.slug || selected.id || "—")}</p>`;
+  const markets = Array.isArray(selected.markets) ? selected.markets : [];
+  if (!markets.length) {
+    $("markets").innerHTML = '<p class="muted">No market details included in the event response.</p>';
+    return;
+  }
+
+  $("markets").innerHTML = markets.map(m => {
+    const outcomes = Array.isArray(m.outcomes) ? m.outcomes : [];
+    return `<div class="market"><strong>${text(m.question || m.title || m.groupItemTitle || "Market")}</strong>
+      ${outcomes.map(o => `<div>${text(o.name)} · ${o.gammaPrice == null ? "Price unavailable" : text(o.gammaPrice)}</div>`).join("")}
+    </div>`;
+  }).join("");
+}
+
+async function loadEvents() {
+  $("status").textContent = "Checking live events…";
+  $("error").textContent = "";
+  try {
+    const r = await fetch("/api/events", {cache:"no-store"});
+    const data = await r.json();
+    if (!r.ok || data.error) throw new Error(data.detail || data.error || `HTTP ${r.status}`);
+
+    const raw = Array.isArray(data) ? data : (data.events || data.matches || []);
+    events = raw.filter(isLive);
+    $("status").textContent = "Event discovery completed";
+    $("last").textContent = "Last update: " + new Date().toLocaleTimeString();
+    if (selected && !events.some(e => eventId(e) === eventId(selected))) selected = null;
+    renderMatches();
+    if (selected) renderSelected();
+    else {
+      $("selectedTitle").textContent = "Selected match";
+      $("details").textContent = "Select a live match from the list.";
+      $("markets").innerHTML = "";
+    }
+  } catch (err) {
+    $("status").textContent = "Could not load live matches";
+    $("error").textContent = err.message;
+    $("matches").innerHTML = '<p class="muted">Event discovery failed. Use Refresh matches to try again.</p>';
+    $("counts").textContent = `Matches: 0 · Feed: ${feedStatus}`;
+  }
+}
+
+function connectFeed() {
+  clearTimeout(reconnectTimer);
+  if (ws) {
+    ws.onclose = null;
+    ws.close();
+  }
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(`${protocol}//${location.host}/ws`);
+  ws.onopen = () => {
+    feedStatus = "connected";
+    $("counts").textContent = `Matches: ${events.length} · Feed: ${feedStatus}`;
+    if (selected) subscribeSelected();
+  };
+  ws.onmessage = ev => {
+    lastPacket = new Date();
+    $("last").textContent = "Last feed packet: " + lastPacket.toLocaleTimeString();
+    try {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === "connection") {
+        feedStatus = msg.status || "connected";
+        $("counts").textContent = `Matches: ${events.length} · Feed: ${feedStatus}`;
+      }
+    } catch {}
+  };
+  ws.onclose = () => {
+    feedStatus = "reconnecting";
+    $("counts").textContent = `Matches: ${events.length} · Feed: ${feedStatus}`;
+    reconnectTimer = setTimeout(connectFeed, 3000);
+  };
+  ws.onerror = () => { feedStatus = "connection error"; };
+}
+
+function subscribeSelected() {
+  if (!selected || !ws || ws.readyState !== WebSocket.OPEN) return;
+  const ids = [];
+  (selected.markets || []).forEach(m => {
+    (m.outcomes || []).forEach(o => { if (o.tokenId) ids.push(String(o.tokenId)); });
+  });
+  ws.send(JSON.stringify({type:"subscribe",tokenIds:[...new Set(ids)]}));
+}
+
+document.querySelectorAll("#sports button").forEach(b => b.addEventListener("click", () => {
+  sport = b.dataset.sport;
+  document.querySelectorAll("#sports button").forEach(x => x.classList.toggle("active", x === b));
+  renderMatches();
+}));
+$("filter").addEventListener("input", renderMatches);
+$("refresh").addEventListener("click", loadEvents);
+
+connectFeed();
+loadEvents();
+setInterval(loadEvents, 60000);
+</script>
+</body>
+</html>
+
